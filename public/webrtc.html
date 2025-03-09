@@ -1,0 +1,220 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>WebRTC Screen Sharing</title>
+    <style>
+      #localVideo,
+      #remoteVideosContainer video {
+        width: 300px;
+        margin: 10px;
+        border: 1px solid black;
+      }
+
+      #remoteVideosContainer {
+        display: flex;
+        flex-wrap: wrap;
+      }
+
+      button {
+        margin: 10px;
+        padding: 10px;
+        font-size: 16px;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>WebRTC Screen Sharing Demo</h1>
+
+    <!-- Local video element to display user's webcam and screen -->
+    <video id="localVideo" autoplay muted></video>
+
+    <!-- Container for remote video streams -->
+    <div id="remoteVideosContainer"></div>
+
+    <!-- Buttons to initiate actions -->
+    <button id="startCall">Start Call</button>
+    <button id="shareScreen">Share Screen</button>
+
+    <script src="/socket.io/socket.io.js"></script>
+    <!-- Assuming your socket.io script is hosted locally -->
+    <script>
+      // Set up socket connection to signaling server
+      const socket = io("http://localhost:3001"); // Use your signaling server's address
+
+      // References to video elements
+      const localVideo = document.getElementById("localVideo");
+      const remoteVideosContainer = document.getElementById(
+        "remoteVideosContainer"
+      );
+
+      // Global variables for WebRTC connection
+      let localStream;
+      let peerConnections = {}; // Store peer connections for multiple viewers
+      let isInitiator = false; // Whether the user is the initiator of the call
+
+      // Constraints for media stream (video/audio)
+      const mediaConstraints = {
+        video: true,
+        audio: true,
+      };
+
+      // Get user media (video + audio)
+      navigator.mediaDevices
+        .getUserMedia(mediaConstraints)
+        .then((stream) => {
+          localStream = stream;
+          localVideo.srcObject = stream; // Display local video
+        })
+        .catch((error) => {
+          console.error("Error accessing media devices:", error);
+          alert("Error accessing media devices. Please check permissions.");
+        });
+
+      // Get screen share stream
+      document.getElementById("shareScreen").addEventListener("click", () => {
+        navigator.mediaDevices
+          .getDisplayMedia({ video: true })
+          .then((screenStream) => {
+            // Combine webcam and screen stream
+            const combinedStream = new MediaStream([
+              ...localStream.getTracks(),
+              ...screenStream.getTracks(),
+            ]);
+            localStream = combinedStream;
+
+            // Display combined stream in local video
+            localVideo.srcObject = localStream;
+
+            // Broadcast the combined stream to all connected peers
+            for (let peerId in peerConnections) {
+              const peerConnection = peerConnections[peerId];
+              localStream.getTracks().forEach((track) => {
+                peerConnection.addTrack(track, localStream);
+              });
+            }
+          })
+          .catch((error) => {
+            console.error("Error sharing screen:", error);
+            alert("Error sharing screen. Please check permissions.");
+          });
+      });
+
+      // Start the call by creating a WebRTC offer
+      document.getElementById("startCall").addEventListener("click", () => {
+        isInitiator = true;
+        startCall();
+      });
+
+      // Function to start the call and create WebRTC offer
+      function startCall() {
+        // Create a new RTCPeerConnection
+        const peerConnection = new RTCPeerConnection();
+
+        // Add local media stream to the peer connection
+        localStream.getTracks().forEach((track) => {
+          peerConnection.addTrack(track, localStream);
+        });
+
+        // Store the peer connection
+        const peerId = generatePeerId();
+        peerConnections[peerId] = peerConnection;
+
+        // Set up ICE candidate handling
+        peerConnection.onicecandidate = (event) => {
+          if (event.candidate) {
+            socket.emit("signal", {
+              type: "ice-candidate",
+              candidate: event.candidate,
+              peerId: peerId,
+            });
+          }
+        };
+
+        // Set up remote stream handling
+        peerConnection.ontrack = (event) => {
+          const remoteVideo = document.createElement("video");
+          remoteVideo.srcObject = event.streams[0];
+          remoteVideo.autoplay = true;
+          remoteVideosContainer.appendChild(remoteVideo); // Display remote video
+        };
+
+        // Create an offer to initiate the call
+        peerConnection
+          .createOffer()
+          .then((offer) => {
+            return peerConnection.setLocalDescription(offer);
+          })
+          .then(() => {
+            socket.emit("signal", {
+              type: "offer",
+              offer: peerConnection.localDescription,
+              peerId: peerId,
+            });
+          })
+          .catch((error) => {
+            console.error("Error creating offer:", error);
+          });
+      }
+
+      // Handle incoming signaling messages from the server
+      socket.on("signal", (data) => {
+        if (data.type === "offer") {
+          // If we receive an offer, set it as the remote description
+          const peerConnection = new RTCPeerConnection();
+          peerConnections[data.peerId] = peerConnection; // Store peer connection
+
+          peerConnection
+            .setRemoteDescription(new RTCSessionDescription(data.offer))
+            .then(() => {
+              // Create an answer to the offer
+              return peerConnection.createAnswer();
+            })
+            .then((answer) => {
+              return peerConnection.setLocalDescription(answer);
+            })
+            .then(() => {
+              socket.emit("signal", {
+                type: "answer",
+                answer: peerConnection.localDescription,
+                peerId: data.peerId,
+              });
+            })
+            .catch((error) => {
+              console.error("Error handling offer:", error);
+            });
+        }
+
+        if (data.type === "answer") {
+          // If we receive an answer, set it as the remote description
+          const peerConnection = peerConnections[data.peerId];
+          if (peerConnection) {
+            peerConnection
+              .setRemoteDescription(new RTCSessionDescription(data.answer))
+              .catch((error) => {
+                console.error("Error handling answer:", error);
+              });
+          }
+        }
+
+        if (data.type === "ice-candidate") {
+          // If we receive an ICE candidate, add it to the peer connection
+          const peerConnection = peerConnections[data.peerId];
+          if (peerConnection) {
+            peerConnection
+              .addIceCandidate(new RTCIceCandidate(data.candidate))
+              .catch((error) => {
+                console.error("Error adding ICE candidate:", error);
+              });
+          }
+        }
+      });
+
+      // Generate a unique peer ID (simple method, improve as needed)
+      function generatePeerId() {
+        return Math.random().toString(36).substr(2, 9);
+      }
+    </script>
+  </body>
+</html>
